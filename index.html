@@ -289,18 +289,19 @@ const L = {
   g: 1793022600, d: 600, chain: null, cfgOk: false,
   skew: 0, skewSamples: [],
   settled: 0, status: null, meas: null, openWork: null, openWorkRound: 0,
-  tod: null, statsAt: 0, ambiguous: [], seen: new Set(),
+  tod: null, statsAt: 0, ambiguous: [], seen: new Set(), walk: null,
   sel: null, stake: 100, lastStatusAt: 0, apiErr: 0, histReady: false,
 };
 // Forget everything tied to the previous game installation; ensureReady() then reloads it.
 function resetSession(){
-  L.cfgOk = false; L.histReady = false; L.settled = 0; L.ambiguous = []; L.seen = new Set();
+  L.cfgOk = false; L.histReady = false; L.settled = 0; L.ambiguous = []; L.seen = new Set(); L.walk = null;
   L.openWork = null; L.tod = null; L.statsAt = 0; L.skewSamples = []; L.skew = 0;
   lastTarget = 0;
 }
 // API numbers arrive as strings; anything missing or malformed becomes NaN and is ignored.
 const num = x => (typeof x === 'string' || typeof x === 'number') && String(x).trim() !== '' && Number.isFinite(+x) ? +x : NaN;
-const bumpSettled = v => { if (Number.isInteger(v) && v >= 0) L.settled = Math.max(L.settled, v); };
+// L.settled only moves forward; a jump of more than 30 days of rounds at once is treated as bad data
+const bumpSettled = v => { if (Number.isInteger(v) && v >= 0 && (L.settled === 0 || v - L.settled <= 30 * 86400 / L.d)) L.settled = Math.max(L.settled, v); };
 const now = () => Date.now() + L.skew;
 const roundAt = t => Math.floor((t/1000 - L.g) / L.d) + 1;           // round in progress at time t
 const roundStart = r => (L.g + (r-1) * L.d) * 1000;
@@ -335,25 +336,30 @@ function applyBatch(a, b, active, work, recorded){
 
 // The API is one game installation (today a Sepolia test). If it is replaced (e.g. mainnet launch),
 // round numbers restart, so stored rounds are dropped and open calls are refunded.
+// Returns false when a response comes from an installation this page has already moved away from
+// (a cached /v1/status can lag a few seconds behind a switch); such responses are ignored.
 function checkInstallation(id){
-  if (typeof id !== 'string' || !id) return;
+  if (typeof id !== 'string' || !id) return true;
   reload();
-  if (S.inst === id) return;
+  if (S.inst === id) return true;
+  if (Array.isArray(S.oldInsts) && S.oldInsts.includes(id)) return false;
   const switched = transact(() => {
     if (!S.inst) { S.inst = id; return false; }
     if (S.inst === id) return false;
     for (const pk of S.picks) if (pk.status === 'open') { S.bank += pk.stake; S.oracle += pk.stake; pk.status = 'void'; pk.voidReason = 'installation'; }
+    S.oldInsts = (Array.isArray(S.oldInsts) ? S.oldInsts : []).concat(S.inst).slice(-10);
     S.rounds = {}; S.inst = id;
     return true;
   });
   if (switched) { resetSession(); toast('Squeekchain started a new game installation. Open calls were refunded.'); }
+  return true;
 }
 // Work in the round that is running now, or null if the latest status snapshot belongs to an earlier round.
 const liveWork = () => (L.openWork != null && L.openWorkRound === roundAt(now())) ? L.openWork : null;
 
 async function loadCore(){
   const j = await getJSON('/v1/core');
-  checkInstallation(j.installationId);
+  if (!checkInstallation(j?.installationId)) return;
   const c = (j && j.configuration) || {};
   let g = num(c.genesisTimestamp); const d = num(c.roundDuration);
   if (!Number.isFinite(g) && typeof c.genesisTimestamp === 'string' && Number.isFinite(Date.parse(c.genesisTimestamp))) g = Date.parse(c.genesisTimestamp) / 1000;
@@ -374,7 +380,7 @@ async function loadCore(){
 async function loadEventsPage(cursor){
   const q = '/v1/events?category=protocol&limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
   const j = await getJSON(q);
-  checkInstallation(j?.installationId);
+  if (!checkInstallation(j?.installationId)) return { next: null, min: Infinity, max: -Infinity, stale: true };
   let min = Infinity, max = -Infinity;
   for (const e of (Array.isArray(j?.events) ? j.events : [])) {
     if (!e || typeof e !== 'object' || e.type !== 'system.settlement_completed' || !e.payload || typeof e.payload !== 'object') continue;
@@ -386,31 +392,36 @@ async function loadEventsPage(cursor){
   return { next, min, max };
 }
 
-// Walks settlement history from the newest page down to minRound. Every walk starts at the top,
-// so rounds missed while the tab slept are fetched too. Returns what the walk actually covered.
+// Walks settlement history from the newest page down to minRound, so rounds missed while the tab
+// slept are fetched too. A walk that has not reached minRound yet resumes from its cursor on the next
+// call (at most maxPages per call); once it reaches minRound or the end of history, the next walk
+// starts again from the newest page. Returns what the current walk has covered.
 async function walkHistory(minRound, maxPages){
-  let cursor = null, min = Infinity, max = -Infinity, end = false;
-  for (let pages = 0; pages < maxPages; pages++) {
-    const r = await loadEventsPage(cursor);
-    min = Math.min(min, r.min); max = Math.max(max, r.max);
-    if (min <= minRound) break;
-    if (!r.next || r.next === cursor) { end = true; break; }
-    cursor = r.next;
+  let w = L.walk;
+  if (!w || w.done) w = L.walk = { cursor: null, min: Infinity, max: -Infinity, end: false, done: false };
+  for (let pages = 0; pages < maxPages && !w.done; pages++) {
+    const r = await loadEventsPage(w.cursor);
+    if (r.stale) break;
+    w.min = Math.min(w.min, r.min); w.max = Math.max(w.max, r.max);
+    if (w.min <= minRound) w.done = true;
+    else if (!r.next || r.next === w.cursor) { w.end = true; w.done = true; }
+    else w.cursor = r.next;
   }
-  return { min, max, end };
+  return { min: w.min, max: w.max, end: w.end };
 }
 
 async function loadStatus(){
   const j = await getJSON('/v1/status');
   if (!j || typeof j !== 'object') throw new Error('bad status');
-  checkInstallation(j.installationId);
+  if (!checkInstallation(j.installationId)) return;
   // generatedAt is a cached snapshot time, so each reading is only a lower bound on the server clock.
   // The clock moves forward only when the local clock is provably behind, using the second-highest
   // of the last 12 readings so one bad timestamp can't shift it. A fast local clock just locks early.
   const srv = Date.parse(j.generatedAt);
   if (Number.isFinite(srv)) {
     const v = srv - Date.now();
-    if (Math.abs(v) <= 6 * 3600 * 1000) { L.skewSamples.push(v); if (L.skewSamples.length > 12) L.skewSamples.shift(); }
+    // a slow device clock (positive offset) is the dangerous direction, so large positive readings are kept
+    if (v >= -6 * 3600 * 1000) { L.skewSamples.push(v); if (L.skewSamples.length > 12) L.skewSamples.shift(); }
   }
   L.status = j; L.meas = (j.measurement && typeof j.measurement === 'object') ? j.measurement : null; L.lastStatusAt = Date.now();
   const anchor = j.builder?.anchor, q = j.builder?.queued;
@@ -427,7 +438,7 @@ function updateSkew(){
   // one reading alone is trusted only for a small correction; from two on, the highest is ignored
   let skew = s.length >= 2 ? s[1] : (s.length === 1 && s[0] <= 600 * 1000 ? s[0] : 0);
   // A settled round has ended, so the server clock is at least past its end.
-  if (L.cfgOk && L.settled > 0) { const floor = roundEnd(L.settled) - Date.now(); if (floor <= 3600 * 1000) skew = Math.max(skew, floor); }
+  if (L.cfgOk && L.settled > 0) { const floor = roundEnd(L.settled) - Date.now(); if (floor <= Math.max(skew, 0) + 30 * 60 * 1000) skew = Math.max(skew, floor); }
   L.skew = skew > 1000 ? skew : 0;
 }
 // Calls need a fresh status reading: it is how the page knows the clock and that the feed is live.
@@ -436,7 +447,7 @@ const clockOk = () => Date.now() - L.lastStatusAt < 30000;
 async function loadStats(){
   L.statsAt = Date.now();
   const j = await getJSON('/v1/measurement/stats?range=7d');
-  checkInstallation(j?.installationId);
+  if (!checkInstallation(j?.installationId)) return;
   const td = j?.activity?.typicalDay;
   if (Array.isArray(td)) {
     const tod = new Array(48).fill(null);
@@ -496,19 +507,23 @@ function model(target){
 const targetRound = () => roundAt(now()) + 1;
 const locked = r => roundStart(r) - now() <= LOCK_S*1000;
 const pickFor = r => S.picks.find(x => x.round === r && x.status === 'open');
+// A round the chain has already settled, or whose result is already known, can never take a call,
+// whatever the device clock says.
+const bettable = r => Number.isInteger(r) && r > L.settled && S.rounds[r] === undefined && !L.seen.has(r);
 
 function placeCall(){
   const r = targetRound();
-  if (!L.sel || locked(r) || !L.cfgOk || !L.histReady || !clockOk()) return;
+  if (!L.sel || locked(r) || !L.cfgOk || !L.histReady || !clockOk() || !bettable(r)) return;
   const m = (lastM && lastTarget === r) ? lastM : model(r);
   const res = transact(() => {
+    if (!bettable(r)) return 'past';
     if (pickFor(r)) return 'exists';
     if (L.stake > S.bank) return 'funds';
     S.bank -= L.stake; S.oracle -= L.stake;
     S.picks.push({ round:r, band:L.sel, stake:L.stake, mult:m.mult[L.sel], oBand:m.oracle, oMult:m.mult[m.oracle], placedAt:Date.now(), status:'open', tries:0 });
     return 'ok';
   });
-  toast(res === 'ok' ? 'Call placed for round ' + r : res === 'exists' ? 'You already have a call for round ' + r : 'Not enough seeds for that stake');
+  toast(res === 'ok' ? 'Call placed for round ' + r : res === 'exists' ? 'You already have a call for round ' + r : res === 'past' ? 'Round ' + r + ' has already been settled; check your device clock' : 'Not enough seeds for that stake');
   render(true);
 }
 function cancelCall(){
@@ -535,7 +550,7 @@ async function resolvePicks(){
       const minR = Math.min(...pend.map(x => x.round));
       let ok = true;
       try { await loadCore(); } catch { ok = false; }
-      try { walk = await walkHistory(minR, 20); } catch { ok = false; }
+      try { walk = await walkHistory(minR, 6); } catch { ok = false; }
       if (!ok) walk = null;
     }
     const changed = transact(() => {
@@ -561,9 +576,8 @@ async function resolvePicks(){
         S.bank += pk.payout; S.oracle += pk.oPayout;
         pk.status = 'settled'; changed = true;
         if (pk.win) toast('Round ' + pk.round + ': ' + BMAP[b].name + '! +' + fmt(pk.payout) + ' seeds');
-      } else if ((pk.tries >= 3 && pk.missingSince && Date.now() - pk.missingSince > 15 * 60 * 1000) ||
-                 (L.cfgOk && pk.round <= L.settled && roundEnd(pk.round) < now() - 8 * 86400 * 1000)) {
-        // unresolvable after 15 minutes of complete data, or older than the history the page walks
+      } else if (pk.tries >= 3 && pk.missingSince && Date.now() - pk.missingSince > 15 * 60 * 1000) {
+        // the feed has the round and the walk reached it, yet its work is still unknown after 15 minutes
         S.bank += pk.stake; S.oracle += pk.stake; pk.status = 'void'; changed = true;
       }
     }
@@ -636,8 +650,9 @@ function renderNow(full){
   // slip
   $('tgtLbl').textContent = ready ? 'Round ' + tgt : 'Round —';
   const live = clockOk();
-  const isLocked = !ready || !L.histReady || !live || locked(tgt);
-  $('lockIn').textContent = !live && ready && L.histReady ? 'Calls paused: waiting for the live feed' : ready && L.histReady ? (isLocked ? 'Locked, next slip opens in ' + mmss(roundEnd(open) - t) : 'Calls lock in ' + mmss(roundStart(tgt) - t - LOCK_S*1000)) : 'Loading rounds…';
+  const past = ready && !bettable(tgt);
+  const isLocked = !ready || !L.histReady || !live || past || locked(tgt);
+  $('lockIn').textContent = past && L.histReady ? 'Calls paused: checking the clock' : !live && ready && L.histReady ? 'Calls paused: waiting for the live feed' : ready && L.histReady ? (isLocked ? 'Locked, next slip opens in ' + mmss(roundEnd(open) - t) : 'Calls lock in ' + mmss(roundStart(tgt) - t - LOCK_S*1000)) : 'Loading rounds…';
   const pk = pickFor(tgt);
   if (ready && (full || t - lastModelAt > 5000 || tgt !== lastTarget)) { lastM = model(tgt); lastModelAt = t; lastTarget = tgt; }
   for (const b of BANDS) {
@@ -659,7 +674,7 @@ function renderNow(full){
   } else {
     place.hidden = false; cancel.hidden = true;
     place.disabled = isLocked || !L.sel || L.stake > S.bank;
-    place.textContent = isLocked ? (!ready || !L.histReady ? 'Loading rounds…' : !live ? 'Waiting for live feed' : 'Locked') : !L.sel ? 'Pick a band' : 'Call ' + BMAP[L.sel].name + ' · ' + L.stake + ' → ' + fmt(L.stake * (lastM?.mult[L.sel] || 0));
+    place.textContent = isLocked ? (!ready || !L.histReady ? 'Loading rounds…' : past ? 'Checking the clock' : !live ? 'Waiting for live feed' : 'Locked') : !L.sel ? 'Pick a band' : 'Call ' + BMAP[L.sel].name + ' · ' + L.stake + ' → ' + fmt(L.stake * (lastM?.mult[L.sel] || 0));
   }
   const sealed = $('sealed');
   if (pk) {
